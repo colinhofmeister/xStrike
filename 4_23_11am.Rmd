@@ -1,0 +1,505 @@
+---
+title: "Phillies Hackathon EDA"
+output: html_document
+date: "2024-04-15"
+---
+
+#PACKAGE IMPORT
+```{r}
+library(tidyverse)
+library(readr)
+library(caret)
+library(xgboost)
+library(ROCR)
+library(lubridate)
+library(Lahman)
+library(dplyr)
+```
+
+#DATA IMPORT
+```{r}
+df <- read.csv("k_prob.csv")
+df_detail <- read.csv("All_2022_Pitches.csv")
+df_detail_2021 <- read.csv("All_2021_Pitches.csv")
+catcher_info <- read.csv("SFBB_Player_ID_Map.csv")
+ump_data <- read.csv("2022_Umpire.csv")
+```
+
+#V1 UNADJUSTED STRIKE PROBABILITY (XGBOOST)
+```{r}
+#df_detail to apply onto relevant pitches outlined in k_prob
+df_detail <- df_detail %>% 
+  mutate(pitchID = paste0(game_pk,(as.numeric(at_bat_number)+100),(as.numeric(pitch_number)+10)),
+         onBaseCt = ifelse(is.na(on_3b),0,1) + ifelse(is.na(on_2b),0,1) + ifelse(is.na(on_1b),0,1)
+         )
+data <- df %>% 
+  mutate(pitchID = paste0(game_pk,(as.numeric(at_bat_number)+100),(as.numeric(pitch_number)+10)))
+
+#batter_ref to identify large enough sample batters & medians for strike zone location to calculate displacement
+batter_ref <- data %>% 
+  group_by(batter) %>% 
+  summarize(count=n(),
+            sz_top_med = median(sz_top, na.rm=TRUE),
+            sz_bot_med = median(sz_bot, na.rm=TRUE)) %>% 
+  filter(count>=100)
+data <- data %>% 
+  filter(batter %in% batter_ref$batter)
+
+#append batter median sz locations
+data <- left_join(data, batter_ref, by ="batter") 
+data <- data %>% 
+  mutate(sz_top_dif = abs(sz_top - sz_top_med),
+         sz_bot_dif = abs(sz_bot - sz_bot_med),
+         distance_sz_top = sz_top - plate_z,
+         distance_sz_bot = plate_z - sz_bot,
+         sz_displacement = (sz_top_dif + sz_bot_dif)/2,
+         pitcher_r = ifelse(p_throws == 'R', 1, 0),
+         batter_r = ifelse(stand == 'R', 1, 0),
+         fast = ifelse(pitch_type %in% c('FF','FC','SI'), 1, 0),
+         breaking = ifelse(pitch_type %in% c('CS','CU','KC','SL','KN'), 1, 0),
+         offspeed = ifelse(pitch_type %in% c('CH','FS'), 1, 0),
+         called_strike = ifelse((description == 'called_strike'), 1, 0))
+
+#distance_sz_top = top of strike zone - pitch vertical location (+ -> below sz_top)
+#distance_sz_bot = pitch vertical location - bottom of strike zone (+ -> above sz_bot)
+#sz_displacement = irregularity in batter's average sz vertical loacaton
+
+
+
+
+#clean data for model processing
+clean <- data %>% 
+  select(pitchID, called_strike, pitcher_r, batter_r, fast, breaking, plate_x, distance_sz_top, distance_sz_bot, sz_displacement, balls, strikes) %>% 
+  mutate(pitchID = as.numeric(pitchID))
+
+#select variables of interest & append from detail df
+df_detail_joinable <- df_detail %>% 
+  select(pitchID, release_speed, outs_when_up, inning, onBaseCt) %>% 
+  mutate(pitchID = as.numeric(pitchID))
+
+#create dfs for model training & model applying
+clean_df <- left_join(clean, df_detail_joinable , by = 'pitchID') %>% 
+  filter(!is.na(release_speed))
+clean_df_apply <- clean_df
+clean_df$pitchID <- NULL
+
+#-----------------------------------------------------------------------------------------------------------------------
+
+#set seed & 20/80 partition
+set.seed(123)
+trainIndex <- createDataPartition(clean_df$called_strike, p = 0.8, list = FALSE)
+train_data <- clean_df[trainIndex, ]
+test_data <- clean_df[-trainIndex, ]
+
+#prepare training and test sets for XGBoost
+train_features <- train_data %>% select(-called_strike)
+train_target <- train_data$called_strike
+test_features <- test_data %>% select(-called_strike)
+test_target <- test_data$called_strike
+
+#convert data to DMatrix object
+dtrain <- xgb.DMatrix(data = as.matrix(train_features), label = train_target)
+dtest <- xgb.DMatrix(data = as.matrix(test_features), label = test_target)
+
+#parameters for the XGBoost model
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eta = 0.3,
+  gamma = 0,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.6,
+  colsample_bytree = 0.6
+)
+
+#training the model
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 85, 
+                       watchlist = list(eval = dtest, train = dtrain), 
+                       early_stopping_rounds = 10)
+
+#apply model to test set for Accuracy & AUC
+pred <- predict(xgb_model, dtest)
+pred_binary <- ifelse(pred > 0.5, 1, 0)
+conf_matrix <- table(Predicted = pred_binary, Actual = test_target)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+print(paste("Test Accuracy:", accuracy))
+pred_rocr <- prediction(pred, test_target)
+perf <- performance(pred_rocr, "tpr", "fpr")
+auc <- performance(pred_rocr, "auc")
+auc <- auc@y.values[[1]]
+print(paste("Test AUC:", auc))
+
+#apply to clean_df for pitch lookup
+clean_df_apply_features <- clean_df_apply %>% select(-pitchID, -called_strike)
+clean_df_apply_dmatrix <- xgb.DMatrix(data = as.matrix(clean_df_apply_features))
+probabilities_apply <- predict(xgb_model, clean_df_apply_dmatrix, type = "prob")
+clean_df_apply$strike_prob <- probabilities_apply
+
+# Feature Importance
+importance_matrix <- xgb.importance(feature_names = colnames(train_features), model = xgb_model)
+xgb.plot.importance(importance_matrix)
+```
+
+
+
+#V2 ADJUSTMENTS FOR CATCHER FRAMING SKILL
+```{r}
+#CLEANING 2021 DATA FOR CATCHER FRAMING
+df_detail_2021 <- df_detail_2021 %>% 
+  mutate(pitchID = paste0(game_pk,(as.numeric(at_bat_number)+100),(as.numeric(pitch_number)+10)),
+         onBaseCt = ifelse(is.na(on_3b),0,1) + ifelse(is.na(on_2b),0,1) + ifelse(is.na(on_1b),0,1)
+         )
+batter_ref <- df_detail_2021 %>% 
+  group_by(batter) %>% 
+  summarize(count=n(),
+            sz_top_med = median(sz_top, na.rm=TRUE),
+            sz_bot_med = median(sz_bot, na.rm=TRUE)) %>% 
+  filter(count>=100)
+data2021 <- df_detail_2021 %>% 
+  filter(batter %in% batter_ref$batter,
+         description == 'ball' | description == 'called_strike'
+  )
+data2021 <- left_join(data2021, batter_ref, by ="batter") 
+data2021 <- data2021 %>% 
+  mutate(sz_top_dif = abs(sz_top - sz_top_med),
+         sz_bot_dif = abs(sz_bot - sz_bot_med),
+         distance_sz_top = sz_top - plate_z,
+         distance_sz_bot = plate_z - sz_bot,
+         sz_displacement = (sz_top_dif + sz_bot_dif)/2,
+         pitcher_r = ifelse(p_throws == 'R', 1, 0),
+         batter_r = ifelse(stand == 'R', 1, 0),
+         fast = ifelse(pitch_type %in% c('FF','FC','SI'), 1, 0),
+         breaking = ifelse(pitch_type %in% c('CS','CU','KC','SL','KN'), 1, 0),
+         offspeed = ifelse(pitch_type %in% c('CH','FS'),1,0),
+         called_strike = ifelse((description == 'called_strike'), 1, 0))
+clean <- data2021 %>% 
+  select(pitchID, called_strike, pitcher_r, batter_r, fast, breaking, plate_x, distance_sz_top, distance_sz_bot, sz_displacement, balls, strikes, release_speed, outs_when_up, inning, onBaseCt) %>% 
+  mutate(pitchID = as.numeric(pitchID)) %>% 
+  filter(!is.na(release_speed))
+clean_df_apply2021 <- clean
+
+#APPLY xG BOOST MODEL
+clean_df_apply2021_features <- clean_df_apply2021 %>% select(-pitchID, -called_strike)
+clean_df_apply2021_dmatrix <- xgb.DMatrix(data = as.matrix(clean_df_apply2021_features))
+probabilities_apply2021 <- predict(xgb_model, clean_df_apply2021_dmatrix, type = "prob")
+clean_df_apply2021$strike_prob <- probabilities_apply2021
+
+# #CATCHER SKILL MAKING & RESEARCH
+data$pitchID <- as.numeric(data$pitchID)
+catcher_summary2022 <- left_join(clean_df_apply, select(data,pitchID,catcher), by = 'pitchID' ) %>%
+  group_by(catcher) %>%
+  summarize(pitches = n(),
+            Stk = sum(called_strike),
+            xStk = sum(strike_prob)) %>%
+  mutate(StkAx = Stk - xStk, `StkAx/p` = StkAx / pitches)
+
+data2021$pitchID <- as.numeric(data2021$pitchID)
+catcher_summary2021 <- left_join(clean_df_apply2021, select(data2021,pitchID,fielder_2), by = 'pitchID') %>%
+  rename(catcher = fielder_2) %>%
+  group_by(catcher) %>%
+  summarize(pitches = n(),
+            Stk = sum(called_strike),
+            xStk = sum(strike_prob)) %>%
+  mutate(StkAx = Stk - xStk, `StkAx/p` = StkAx / pitches)
+
+# catcher_yoy <- left_join(select(catcher_summary2021_joinable,catcher,StkAx,`StkAx/p`),select(catcher_summary2022_joinable,catcher,StkAx22,`StkAx/p22`), by='catcher') %>% 
+#   filter(!is.na(StkAx22))
+# cor_matrix <- cor(catcher_yoy[c("StkAx", "StkAx22", "StkAx/p", "StkAx/p22")])
+# print(cor_matrix)
+
+#FORMAT DATA FOR ADJUSTED XGBOOST MODEL - USE TOTALS
+catcher_summary2021$season = 2021
+catcher_summary2022$season = 2022
+catcher_ref <- rbind(catcher_summary2021,catcher_summary2022) %>% 
+  select(catcher,season,pitches,Stk,xStk,StkAx,`StkAx/p`)
+
+
+#APPEND CATCHER INFO FOR SMALL SAMPLE BASELINES
+catcher_info <- catcher_info %>% 
+    filter(MLBID %in% catcher_ref$catcher) %>% 
+    mutate(BIRTHDATE = as.Date(BIRTHDATE, format = "%m/%d/%Y"))
+opening_day <- min(df_detail$game_date)
+catcher_ref <- left_join(catcher_ref, catcher_info, by = c("catcher" = "MLBID")) %>% 
+    select(catcher, PLAYERNAME, BIRTHDATE, POS, THROWS, season,
+           pitches, Stk, xStk, StkAx, `StkAx/p`) %>% 
+    mutate(b_year = year(BIRTHDATE),
+           b_month = month(BIRTHDATE),
+           b_day = day(BIRTHDATE))
+catcher_ref <- catcher_ref %>% 
+    arrange(desc(is.na(PLAYERNAME))) %>% 
+    mutate(PLAYERNAME = ifelse(row_number() == 1, "Taylor Davis", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 2, "Erick Castillo", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 3, "Jose Godoy", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 4, "Joseph Odom", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 5, "Ali Sanchez", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 6, "Taylor Gushue", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 7, "Jakson Reetz", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 8, "Patrick Mazeika", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 9, "Tyler Payne", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 10, "Rafael Marchan", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 11, "Sebastian Rivero", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 12, "Jack Kruger", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 13, "Payton Henry", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 14, "Chris Okey", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 15, "Jose Godoy", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 16, "Chuckie Robinson", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 17, "Caleb Hamilton", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 18, "Carlos Perez", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 19, "Mark Kolozsvary", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 20, "Brian O'Keefe", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 21, "Michael Papierski", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 22, "Donny Sands", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 23, "Patrick Mazeika", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 24, "Ford Proctor", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 25, "Sebastian Rivero", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 26, "Mario Feliciano", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 27, "Payton Henry", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 28, "Israel Pineda", PLAYERNAME),
+           PLAYERNAME = ifelse(row_number() == 29, "Bryan Lavastida", PLAYERNAME),
+           POS = ifelse(is.na(POS), "C", POS)
+           )
+catcher_ref %>% 
+    separate(PLAYERNAME, into = c("f_name", "l_name"), sep = " ")
+gp <- Appearances %>% 
+    filter(G_c >= 1) %>% 
+    group_by(playerID) %>% 
+    summarize(G_all = sum(G_all, na.rm = TRUE), 
+              GS = sum(GS, na.rm = TRUE), 
+              G_c = sum(G_c, na.rm = TRUE))
+c_names <- People %>% 
+    left_join(gp, by = "playerID") %>% 
+    filter(!is.na(G_all),
+           playerID != "perezca02") %>% 
+    select(nameFirst, nameLast, debut, G_all, GS, G_c) %>% 
+    mutate(PLAYERNAME = paste0(nameFirst, " ", nameLast),
+           PLAYERNAME = ifelse(nameLast == "d'Arnaud", paste0(nameFirst, " D'Arnaud"), PLAYERNAME),
+           PLAYERNAME = ifelse(nameFirst == "P. J.", paste0("P.J. ", nameLast), PLAYERNAME),
+           PLAYERNAME = ifelse(nameFirst == "J. T.", paste0("J.T. ", nameLast), PLAYERNAME)) 
+catcher_ref <- catcher_ref %>% 
+    left_join(c_names, by = "PLAYERNAME")
+catcher_ref <- catcher_ref %>% 
+    mutate(rookie = ifelse(year(debut) == season, "Y", "N"),
+           days_since_debut = as.numeric(difftime(opening_day, debut, units = "days") / 365.25))
+low_samp_R <- catcher_ref %>% 
+  filter(pitches < 300 & rookie == 'Y') %>% 
+  summarize(med_games = median(G_all), 
+            med_starts = median(GS), 
+            med_pitches = median(pitches),
+            med_Stk = median(Stk),
+            med_xStk = median(xStk),
+            med_StkAx = median(StkAx))
+low_samp_NR <- catcher_ref %>% 
+  filter(pitches < 300 & rookie == 'N') %>% 
+  summarize(med_games = median(G_all), 
+            med_starts = median(GS), 
+            med_pitches = median(pitches),
+            med_Stk = median(Stk),
+            med_xStk = median(xStk),
+            med_StkAx = median(StkAx))
+low_samp_table <- bind_rows(low_samp_R, low_samp_NR, .id = "Strk_Group") %>% 
+    mutate(Strk_Group = ifelse(row_number() == 1, "Y", "N"))
+#UMPIRE DATA
+data$pitchID <- as.numeric(data$pitchID)
+
+hometeam <- df_detail %>%
+  select(pitchID, home_team)
+hometeam$pitchID <- as.numeric(hometeam$pitchID)
+data_w_home <- left_join(data, hometeam, by = c("pitchID"))
+data_w_home <- na.omit(data_w_home)
+
+
+
+umpire_info <- ump_data %>%
+  mutate(Date = format(as.Date(Date, format = "%m/%d/%Y"), "%m/%d/%y"))
+
+data_w_home <- data_w_home %>%
+  mutate(Date = format(mdy(game_date), "%m/%d/%y"))
+
+
+umpire_info$Acc <- as.numeric(as.character(umpire_info$Acc))
+median_accuracy <- umpire_info %>%
+  group_by(Umpire) %>%
+  summarise(MedAcc = median(Acc, na.rm = TRUE))
+
+
+umpire_info <- left_join(umpire_info, median_accuracy, by ="Umpire")
+data_w_home$home_team <- toupper(data_w_home$home_team)
+
+umpire_info_clean <- umpire_info %>%
+  select(Date, Home, Umpire, MedAcc)
+
+
+data_w_home <- left_join(data_w_home, umpire_info_clean, by = c("Date" = "Date", "home_team" = "Home" ))
+
+#BEGIN TO CLEAN DATASET FOR V2
+data$pitchID <- as.numeric(data$pitchID)
+clean_adj <- left_join(clean_df_apply, select(data_w_home, pitchID, MedAcc))
+clean_adj <- left_join(clean_adj, select(data,pitchID,catcher),by='pitchID') %>% 
+  select(-strike_prob)
+catcher_ref_stk <- catcher_ref %>% 
+  filter(season=='2022')
+clean_adj <- left_join(clean_adj,select(catcher_ref_stk,catcher,StkAx),by='catcher')
+catcher_ref_rook <- catcher_ref %>% 
+  filter(season=='2022')
+clean_adj <- left_join(clean_adj,select(catcher_ref_rook,catcher,rookie),by='catcher') %>% 
+  mutate(StkAx = ifelse(is.na(StkAx) & rookie == 'Y', -.673, ifelse(is.na(StkAx) & rookie == 'N', -.82, StkAx))
+         )
+
+#create dfs for model training & model applying
+clean_adj_apply <- clean_adj %>% 
+  select(-rookie,-catcher)
+clean_adj <- clean_adj %>% 
+  select(-pitchID,-catcher,-rookie)
+
+#-----------------------------------------------------------------------------------------------------------------------
+
+#set seed & 20/80 partition
+set.seed(123)
+trainIndex <- createDataPartition(clean_adj$called_strike, p = 0.8, list = FALSE)
+train_data <- clean_adj[trainIndex, ]
+test_data <- clean_adj[-trainIndex, ]
+
+#prepare training and test sets for XGBoost
+train_features <- train_data %>% select(-called_strike)
+train_target <- train_data$called_strike
+test_features <- test_data %>% select(-called_strike)
+test_target <- test_data$called_strike
+
+#convert data to DMatrix object
+dtrain <- xgb.DMatrix(data = as.matrix(train_features), label = train_target)
+dtest <- xgb.DMatrix(data = as.matrix(test_features), label = test_target)
+
+#parameters for the XGBoost model
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eta = 0.3,
+  gamma = 0,
+  max_depth = 3,
+  min_child_weight = 1,
+  subsample = 0.6,
+  colsample_bytree = 0.6
+)
+
+#training the model
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 40,
+                       watchlist = list(eval = dtest, train = dtrain),
+                       early_stopping_rounds = 10)
+
+#apply model to test set for Accuracy & AUC
+pred <- predict(xgb_model, dtest)
+pred_binary <- ifelse(pred > 0.5, 1, 0)
+conf_matrix <- table(Predicted = pred_binary, Actual = test_target)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+print(paste("Test Accuracy:", accuracy))
+pred_rocr <- prediction(pred, test_target)
+perf <- performance(pred_rocr, "tpr", "fpr")
+auc <- performance(pred_rocr, "auc")
+auc <- auc@y.values[[1]]
+print(paste("Test AUC:", auc))
+
+#apply to clean_df for pitch lookup
+clean_adj_apply_features <- clean_adj_apply %>% select(-pitchID, -called_strike)
+clean_adj_apply_dmatrix <- xgb.DMatrix(data = as.matrix(clean_adj_apply_features))
+probabilities_apply <- predict(xgb_model, clean_adj_apply_dmatrix, type = "prob")
+clean_adj_apply$strike_prob <- probabilities_apply
+
+# Feature Importance
+importance_matrix <- xgb.importance(feature_names = colnames(train_features), model = xgb_model)
+xgb.plot.importance(importance_matrix)
+```
+
+#XGBOOST PARAMETER LOOP STRUCTURE
+```{r}
+# # Set seed and partition the data
+# set.seed(123)
+# trainIndex <- createDataPartition(clean_df$called_strike, p = 0.8, list = FALSE)
+# train_data <- clean_df[trainIndex, ]
+# test_data <- clean_df[-trainIndex, ]
+# 
+# # Prepare training and test sets
+# train_features <- train_data %>% select(-called_strike)
+# train_target <- train_data$called_strike
+# test_features <- test_data %>% select(-called_strike)
+# test_target <- test_data$called_strike
+# 
+# # Convert data to DMatrix object
+# dtrain <- xgb.DMatrix(data = as.matrix(train_features), label = train_target)
+# dtest <- xgb.DMatrix(data = as.matrix(test_features), label = test_target)
+# 
+# # Define a grid of parameters to explore
+# param_grid <- expand.grid(
+#   eta = .3,
+#   max_depth = c(4, 5, 6),
+#   min_child_weight = c(1,3,5),
+#   subsample = .6,
+#   colsample_bytree = .6,
+#   gamma = 0,
+#   stringsAsFactors = FALSE
+# )
+# 
+# # Data frame to store results
+# results <- data.frame(
+#   eta = numeric(),
+#   max_depth = integer(),
+#   min_child_weight = integer(),
+#   subsample = numeric(),
+#   colsample_bytree = numeric(),
+#   gamma = numeric(),
+#   accuracy = numeric(),
+#   auc = numeric(),
+#   stringsAsFactors = FALSE
+# )
+# 
+# # Loop over each set of parameters
+# for (i in 1:nrow(param_grid)) {
+#   params <- list(
+#     booster = "gbtree",
+#     objective = "binary:logistic",
+#     eta = param_grid$eta[i],
+#     max_depth = param_grid$max_depth[i],
+#     min_child_weight = param_grid$min_child_weight[i],
+#     subsample = param_grid$subsample[i],
+#     colsample_bytree = param_grid$colsample_bytree[i],
+#     gamma = param_grid$gamma[i]
+#   )
+#   
+#   # Train the model
+#   xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 75,
+#                          watchlist = list(eval = dtest, train = dtrain), 
+#                          early_stopping_rounds = 10, silent = 1)
+# 
+#   # Predict and evaluate
+#   pred <- predict(xgb_model, dtest)
+#   pred_binary <- ifelse(pred > 0.5, 1, 0)
+#   conf_matrix <- table(Predicted = pred_binary, Actual = test_target)
+#   accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+#   pred_rocr <- prediction(pred, test_target)
+#   auc <- performance(pred_rocr, "auc")@y.values[[1]]
+# 
+#   # Store results
+#   results <- rbind(results, data.frame(
+#     eta = param_grid$eta[i],
+#     max_depth = param_grid$max_depth[i],
+#     min_child_weight = param_grid$min_child_weight[i],
+#     subsample = param_grid$subsample[i],
+#     colsample_bytree = param_grid$colsample_bytree[i],
+#     gamma = param_grid$gamma[i],
+#     accuracy = accuracy,
+#     auc = auc,
+#     stringsAsFactors = FALSE
+#   ))
+# }
+```
+
+#PITCH VIDEO LOOKUP TOOL
+```{r}
+strike_df <- clean_df_apply %>%
+  filter(called_strike == 1)
+
+id_of_interest <- '66256416711'
+interest <- data %>%
+  filter(pitchID == id_of_interest)
+print(interest$broadcast)
+```
